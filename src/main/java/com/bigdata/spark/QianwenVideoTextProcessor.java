@@ -10,6 +10,10 @@ import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.SaveMode;
+import org.apache.spark.sql.Encoder;
+import org.apache.spark.sql.catalyst.encoders.RowEncoder;
+import org.apache.spark.sql.types.StructType;
+import org.apache.spark.sql.types.DataTypes;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -155,10 +159,10 @@ public class QianwenVideoTextProcessor implements Serializable {
                 logger.info("分区处理完成: 成功={}, 失败={}", processedCount, errorCount);
                 return results.iterator();
             },
-            org.apache.spark.sql.Encoders.row(
-                new org.apache.spark.sql.types.StructType()
-                    .add("dev_serial", org.apache.spark.sql.types.DataTypes.StringType, false)
-                    .add("tag_result", org.apache.spark.sql.types.DataTypes.StringType, false)
+            RowEncoder.apply(
+                new StructType()
+                    .add("dev_serial", DataTypes.StringType, false)
+                    .add("tag_result", DataTypes.StringType, false)
             )
         );
 
