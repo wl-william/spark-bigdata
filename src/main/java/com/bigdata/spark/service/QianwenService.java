@@ -38,11 +38,32 @@ public class QianwenService implements Serializable {
         "请根据用户提供的视频文本内容，提取关键标签。" +
         "要求：1)标签简洁明了 2)用逗号分隔 3)最多5个标签 4)只返回标签，不要其他说明";
 
+    // 使用transient避免序列化Generation对象
+    private transient Generation generation;
+
     public QianwenService(String apiKey, String modelName, int maxRetries, int retryDelayMs) {
         this.apiKey = apiKey;
         this.modelName = modelName;
         this.maxRetries = maxRetries;
         this.retryDelayMs = retryDelayMs;
+    }
+
+    /**
+     * 懒加载Generation对象，避免序列化问题
+     */
+    private Generation getGeneration() {
+        if (generation == null) {
+            synchronized (this) {
+                if (generation == null) {
+                    logger.info("初始化DashScope Generation客户端");
+                    generation = new Generation(
+                        Protocol.HTTP.getValue(),
+                        "https://dashscope.aliyuncs.com/api/v1"
+                    );
+                }
+            }
+        }
+        return generation;
     }
 
     /**
@@ -111,10 +132,8 @@ public class QianwenService implements Serializable {
     private String callQianwenAPI(String videoText)
             throws ApiException, NoApiKeyException, InputRequiredException {
 
-        Generation gen = new Generation(
-            Protocol.HTTP.getValue(),
-            "https://dashscope.aliyuncs.com/api/v1"
-        );
+        // 使用懒加载的Generation对象
+        Generation gen = getGeneration();
 
         // 构建消息
         Message systemMsg = Message.builder()

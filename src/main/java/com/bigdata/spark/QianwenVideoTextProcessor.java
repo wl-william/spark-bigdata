@@ -64,8 +64,17 @@ public class QianwenVideoTextProcessor implements Serializable {
         SparkConf conf = new SparkConf()
             .setAppName("QianwenVideoTextProcessor-" + processDate)
             .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+            // 自适应查询执行
             .set("spark.sql.adaptive.enabled", "true")
-            .set("spark.sql.adaptive.coalescePartitions.enabled", "true");
+            .set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+            // Hive动态分区配置
+            .set("hive.exec.dynamic.partition", "true")
+            .set("hive.exec.dynamic.partition.mode", "nonstrict")
+            .set("hive.exec.max.dynamic.partitions", "10000")
+            .set("hive.exec.max.dynamic.partitions.pernode", "1000")
+            // 控制输出文件数
+            .set("spark.sql.shuffle.partitions", "50")  // 减少shuffle分区数
+            .set("spark.sql.files.maxRecordsPerFile", "100000");  // 每个文件最多10万条记录
 
         // 创建SparkSession
         SparkSession spark = SparkSession.builder()
@@ -170,18 +179,32 @@ public class QianwenVideoTextProcessor implements Serializable {
         Dataset<Row> finalDataset = resultDataset.withColumn("dt",
             org.apache.spark.sql.functions.lit(processDate));
 
-        // 4. 写入Hive表
+        // 4. 优化输出文件数
+        // 获取数据量并计算合适的分区数
+        long totalCount = finalDataset.count();
+        logger.info("准备写入 {} 条记录", totalCount);
+
+        // 根据数据量动态调整分区数（每个分区约10万条记录）
+        int targetPartitions = Math.max(1, (int) Math.ceil(totalCount / 100000.0));
+        // 限制最大分区数为50，避免产生过多小文件
+        targetPartitions = Math.min(targetPartitions, 50);
+
+        logger.info("使用 {} 个分区写入数据", targetPartitions);
+
+        // 重分区以控制输出文件数
+        Dataset<Row> optimizedDataset = finalDataset.coalesce(targetPartitions);
+
+        // 5. 写入Hive表
         String targetTable = "dwd.dwd_device_cloudstorage_tag_by_qianwen";
         logger.info("写入目标表: {}", targetTable);
 
-        finalDataset.write()
+        optimizedDataset.write()
             .mode(SaveMode.Append)
             .partitionBy("dt")
             .format("hive")
             .saveAsTable(targetTable);
 
-        long resultCount = finalDataset.count();
-        logger.info("成功写入 {} 条记录到表 {}", resultCount, targetTable);
+        logger.info("成功写入 {} 条记录到表 {}，预计生成 {} 个文件", totalCount, targetTable, targetPartitions);
     }
 
     /**
