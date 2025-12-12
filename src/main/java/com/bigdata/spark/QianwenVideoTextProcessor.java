@@ -180,16 +180,13 @@ public class QianwenVideoTextProcessor implements Serializable {
             org.apache.spark.sql.functions.lit(processDate));
 
         // 4. 优化输出文件数
-        // 获取数据量并计算合适的分区数
-        long totalCount = finalDataset.count();
-        logger.info("准备写入 {} 条记录", totalCount);
-
-        // 根据数据量动态调整分区数（每个分区约10万条记录）
-        int targetPartitions = Math.max(1, (int) Math.ceil(totalCount / 100000.0));
+        // 【重要修复】根据源数据量估算分区数，避免在API调用后再count导致重复执行
+        // totalRecords 已在前面获取，直接使用
+        int targetPartitions = Math.max(1, (int) Math.ceil(totalRecords / 100000.0));
         // 限制最大分区数为50，避免产生过多小文件
         targetPartitions = Math.min(targetPartitions, 50);
 
-        logger.info("使用 {} 个分区写入数据", targetPartitions);
+        logger.info("预计处理 {} 条记录，使用 {} 个分区写入数据", totalRecords, targetPartitions);
 
         // 重分区以控制输出文件数
         Dataset<Row> optimizedDataset = finalDataset.coalesce(targetPartitions);
@@ -204,7 +201,7 @@ public class QianwenVideoTextProcessor implements Serializable {
             .format("hive")
             .saveAsTable(targetTable);
 
-        logger.info("成功写入 {} 条记录到表 {}，预计生成 {} 个文件", totalCount, targetTable, targetPartitions);
+        logger.info("成功写入数据到表 {}，预计生成 {} 个文件", targetTable, targetPartitions);
     }
 
     /**
