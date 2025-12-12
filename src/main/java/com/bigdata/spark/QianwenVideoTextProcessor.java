@@ -1,19 +1,16 @@
 package com.bigdata.spark;
 
-import com.bigdata.spark.model.VideoTextRecord;
-import com.bigdata.spark.model.TaggedRecord;
 import com.bigdata.spark.service.QianwenService;
 import com.bigdata.spark.util.RateLimiter;
 import org.apache.spark.SparkConf;
-import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.SaveMode;
-import org.apache.spark.sql.Encoder;
 import org.apache.spark.sql.catalyst.encoders.RowEncoder;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.storage.StorageLevel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -99,6 +96,11 @@ public class QianwenVideoTextProcessor implements Serializable {
 
     /**
      * 处理数据主流程
+     *
+     * 【性能优化关键点】:
+     * 1. 在API调用后立即缓存结果，防止task失败导致重复调用API
+     * 2. 使用insertInto替代saveAsTable提升Hive写入效率
+     * 3. 避免不必要的shuffle操作
      */
     private static void processData(SparkSession spark, String processDate) {
         // 1. 从Hive读取源数据
@@ -112,36 +114,35 @@ public class QianwenVideoTextProcessor implements Serializable {
         logger.info("执行SQL: {}", sourceSQL);
         Dataset<Row> sourceData = spark.sql(sourceSQL);
 
-        // 过滤空值
-        sourceData = sourceData.filter("dev_serial IS NOT NULL AND video_text_merged IS NOT NULL");
+        // 过滤空值并缓存源数据，避免后续操作重复读取Hive
+        sourceData = sourceData.filter("dev_serial IS NOT NULL AND video_text_merged IS NOT NULL")
+                               .persist(StorageLevel.MEMORY_AND_DISK());
 
         long totalRecords = sourceData.count();
         logger.info("读取到 {} 条记录", totalRecords);
 
         if (totalRecords == 0) {
             logger.warn("没有数据需要处理");
+            sourceData.unpersist();
             return;
         }
 
-        // 2. 【P0优化】重分区以提升并行度
-        // 使用repartition而非coalesce，确保数据均匀分布到指定分区数
+        // 2. 重分区以提升并行度
         int sourcePartitions = sourceData.rdd().getNumPartitions();
         logger.info("源数据分区数: {}, 将重分区为: {}", sourcePartitions, PROCESS_PARTITIONS);
 
         Dataset<Row> repartitionedData = sourceData.repartition(PROCESS_PARTITIONS);
 
-        // 【P0优化】计算每个分区的限流配额
-        // 将总配额平分到各分区，避免超出账户级别TPM限制
+        // 计算每个分区的限流配额
         final int perPartitionTPM = TPM_LIMIT / PROCESS_PARTITIONS;
         logger.info("每分区TPM配额: {} (总配额: {}，分区数: {})",
             perPartitionTPM, TPM_LIMIT, PROCESS_PARTITIONS);
 
-        // 3. 转换为JavaRDD进行处理
+        // 3. 调用千问API处理数据
         Dataset<Row> resultDataset = repartitionedData.mapPartitions(
             (Iterator<Row> partition) -> {
                 List<Row> results = new ArrayList<>();
 
-                // 为每个分区创建限流器，使用分配后的配额（避免多分区超出总限额）
                 RateLimiter rateLimiter = new RateLimiter(perPartitionTPM);
                 QianwenService qianwenService = new QianwenService(
                     API_KEY,
@@ -159,15 +160,13 @@ public class QianwenVideoTextProcessor implements Serializable {
                     String videoTextMerged = row.getString(1);
 
                     try {
-                        // 限流控制
                         int estimatedTokens = estimateTokens(videoTextMerged);
                         rateLimiter.acquire(estimatedTokens);
 
-                        // 调用千问模型
                         String tag = qianwenService.generateTag(videoTextMerged);
 
-                        // 创建结果行
-                        results.add(org.apache.spark.sql.RowFactory.create(devSerial, tag));
+                        // 直接创建包含dt字段的完整行，避免后续withColumn操作
+                        results.add(org.apache.spark.sql.RowFactory.create(devSerial, tag, processDate));
                         processedCount++;
 
                         if (processedCount % 10 == 0) {
@@ -177,8 +176,7 @@ public class QianwenVideoTextProcessor implements Serializable {
                     } catch (Exception e) {
                         errorCount++;
                         logger.error("处理记录失败 dev_serial={}: {}", devSerial, e.getMessage());
-                        // 记录失败但继续处理
-                        results.add(org.apache.spark.sql.RowFactory.create(devSerial, "ERROR: " + e.getMessage()));
+                        results.add(org.apache.spark.sql.RowFactory.create(devSerial, "ERROR: " + e.getMessage(), processDate));
                     }
                 }
 
@@ -189,36 +187,48 @@ public class QianwenVideoTextProcessor implements Serializable {
                 new StructType()
                     .add("dev_serial", DataTypes.StringType, false)
                     .add("tag_result", DataTypes.StringType, false)
+                    .add("dt", DataTypes.StringType, false)
             )
         );
 
-        // 4. 添加分区字段
-        Dataset<Row> finalDataset = resultDataset.withColumn("dt",
-            org.apache.spark.sql.functions.lit(processDate));
+        // 4. 【关键优化】立即缓存API调用结果到磁盘！
+        // 这是防止API被重复调用的核心：确保结果物化后才进行后续操作
+        logger.info("正在缓存API调用结果...");
+        resultDataset = resultDataset.persist(StorageLevel.MEMORY_AND_DISK());
 
-        // 5. 优化输出文件数
-        // 【重要修复】根据源数据量估算分区数，避免在API调用后再count导致重复执行
-        // totalRecords 已在前面获取，直接使用
-        int targetPartitions = Math.max(1, (int) Math.ceil(totalRecords / 100000.0));
-        // 限制最大分区数为50，避免产生过多小文件
-        targetPartitions = Math.min(targetPartitions, 50);
+        // 强制物化数据，触发API调用执行
+        long processedRecords = resultDataset.count();
+        logger.info("API调用完成，共处理 {} 条记录，结果已缓存", processedRecords);
 
-        logger.info("预计处理 {} 条记录，使用 {} 个分区写入数据", totalRecords, targetPartitions);
+        // 释放源数据缓存，节省内存
+        sourceData.unpersist();
 
-        // 重分区以控制输出文件数
-        Dataset<Row> optimizedDataset = finalDataset.coalesce(targetPartitions);
-
-        // 6. 写入Hive表
+        // 5. 写入Hive表
+        // 使用insertInto替代saveAsTable，效率更高
         String targetTable = "dwd.dwd_device_cloudstorage_tag_by_qianwen";
         logger.info("写入目标表: {}", targetTable);
 
-        optimizedDataset.write()
-            .mode(SaveMode.Append)
-            .partitionBy("dt")
-            .format("hive")
-            .saveAsTable(targetTable);
+        try {
+            // 确保分区存在
+            spark.sql(String.format(
+                "ALTER TABLE %s ADD IF NOT EXISTS PARTITION (dt='%s')",
+                targetTable, processDate
+            ));
+        } catch (Exception e) {
+            logger.warn("创建分区时出现警告（可忽略）: {}", e.getMessage());
+        }
 
-        logger.info("成功写入数据到表 {}，预计生成 {} 个文件", targetTable, targetPartitions);
+        // 直接写入，不使用coalesce避免额外的数据移动
+        // AQE会自动合并小分区
+        resultDataset.write()
+            .mode(SaveMode.Append)
+            .format("parquet")
+            .insertInto(targetTable);
+
+        logger.info("成功写入数据到表 {}，共 {} 条记录", targetTable, processedRecords);
+
+        // 释放结果缓存
+        resultDataset.unpersist();
     }
 
     /**
