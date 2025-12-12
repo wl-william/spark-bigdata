@@ -127,7 +127,7 @@ public class QianwenService implements Serializable {
     }
 
     /**
-     * 调用千问API
+     * 调用千问API（带详细性能日志）
      */
     private String callQianwenAPI(String videoText)
             throws ApiException, NoApiKeyException, InputRequiredException {
@@ -157,10 +157,13 @@ public class QianwenService implements Serializable {
             .topP(0.9f)
             .build();
 
-        // 调用API
+        // 调用API并计时
+        long startTime = System.currentTimeMillis();
         GenerationResult result = gen.call(param);
+        long endTime = System.currentTimeMillis();
+        long apiLatency = endTime - startTime;
 
-        // 提取结果
+        // 提取结果并记录token使用情况
         if (result != null &&
             result.getOutput() != null &&
             result.getOutput().getChoices() != null &&
@@ -172,10 +175,21 @@ public class QianwenService implements Serializable {
                 .getMessage()
                 .getContent();
 
-            logger.debug("模型返回: {}", content);
+            // 记录token使用和延迟（用于性能分析）
+            if (result.getUsage() != null) {
+                logger.debug("API调用完成: 延迟={}ms, 输入tokens={}, 输出tokens={}, 总tokens={}",
+                    apiLatency,
+                    result.getUsage().getInputTokens(),
+                    result.getUsage().getOutputTokens(),
+                    result.getUsage().getTotalTokens());
+            } else {
+                logger.debug("API调用完成: 延迟={}ms", apiLatency);
+            }
+
             return content;
         }
 
+        logger.warn("API返回空结果, 延迟={}ms", apiLatency);
         return null;
     }
 

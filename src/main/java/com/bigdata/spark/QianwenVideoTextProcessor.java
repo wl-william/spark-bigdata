@@ -21,6 +21,9 @@ import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Spark应用：从Hive读取视频文本数据，调用千问模型生成标签，写回Hive
@@ -42,11 +45,18 @@ public class QianwenVideoTextProcessor implements Serializable {
     private static final int TPM_LIMIT = 100000; // Tokens per minute (账户级别总配额)
     private static final int BATCH_SIZE = 100; // 每批处理的记录数
     private static final int MAX_RETRIES = 3;
-    private static final int RETRY_DELAY_MS = 2000;
+    private static final int RETRY_DELAY_MS = 1000; // 降低重试延迟以加快恢复
 
     // 并行度配置：根据API限流和集群资源合理设置
-    // 分区数过多会导致限流冲突，过少会浪费并行能力
-    private static final int PROCESS_PARTITIONS = 10; // 处理分区数，可根据实际调整
+    private static final int PROCESS_PARTITIONS = 10; // 处理分区数
+
+    // 【P0优化】分区内并发配置 - 这是提升吞吐量的关键
+    // 每个分区内部使用多线程并发调用API，大幅提升吞吐量
+    private static final int CONCURRENT_CALLS_PER_PARTITION = 5; // 每分区并发调用数
+
+    // RPM限制（请求数/分钟）- 通常API有独立的RPM限制
+    // 千问API RPM限制通常较高（如1000-3000 RPM），这里设保守值
+    private static final int RPM_LIMIT = 500; // 总请求数/分钟限制
 
     public static void main(String[] args) {
         if (args.length < 1) {
@@ -133,56 +143,137 @@ public class QianwenVideoTextProcessor implements Serializable {
         // 【P0优化】计算每个分区的限流配额
         // 将总配额平分到各分区，避免超出账户级别TPM限制
         final int perPartitionTPM = TPM_LIMIT / PROCESS_PARTITIONS;
-        logger.info("每分区TPM配额: {} (总配额: {}，分区数: {})",
-            perPartitionTPM, TPM_LIMIT, PROCESS_PARTITIONS);
+        final int perPartitionRPM = RPM_LIMIT / PROCESS_PARTITIONS;
+        logger.info("===== 限流配置 =====");
+        logger.info("每分区TPM配额: {} (总配额: {})", perPartitionTPM, TPM_LIMIT);
+        logger.info("每分区RPM配额: {} (总配额: {})", perPartitionRPM, RPM_LIMIT);
+        logger.info("每分区并发数: {}", CONCURRENT_CALLS_PER_PARTITION);
+        logger.info("总并发能力: {} 个并发请求", PROCESS_PARTITIONS * CONCURRENT_CALLS_PER_PARTITION);
 
-        // 3. 转换为JavaRDD进行处理
+        // 3. 转换为JavaRDD进行处理（使用并发调用）
         Dataset<Row> resultDataset = repartitionedData.mapPartitions(
             (Iterator<Row> partition) -> {
                 List<Row> results = new ArrayList<>();
 
-                // 为每个分区创建限流器，使用分配后的配额（避免多分区超出总限额）
-                RateLimiter rateLimiter = new RateLimiter(perPartitionTPM);
-                QianwenService qianwenService = new QianwenService(
-                    API_KEY,
-                    MODEL_NAME,
-                    MAX_RETRIES,
-                    RETRY_DELAY_MS
-                );
+                // 为每个分区创建限流器
+                RateLimiter tpmLimiter = new RateLimiter(perPartitionTPM);
+                RateLimiter rpmLimiter = new RateLimiter(perPartitionRPM); // 请求数限流
 
-                int processedCount = 0;
-                int errorCount = 0;
+                // 【P0优化】创建线程池用于并发API调用
+                ExecutorService executor = Executors.newFixedThreadPool(CONCURRENT_CALLS_PER_PARTITION);
+                List<CompletableFuture<Row>> futures = new ArrayList<>();
 
+                // 性能统计
+                AtomicInteger processedCount = new AtomicInteger(0);
+                AtomicInteger errorCount = new AtomicInteger(0);
+                AtomicLong totalApiTimeMs = new AtomicLong(0);
+                AtomicLong totalWaitTimeMs = new AtomicLong(0);
+                long partitionStartTime = System.currentTimeMillis();
+
+                // 收集所有待处理的记录
+                List<Row> pendingRows = new ArrayList<>();
                 while (partition.hasNext()) {
-                    Row row = partition.next();
+                    pendingRows.add(partition.next());
+                }
+                int totalInPartition = pendingRows.size();
+                logger.info("分区开始处理，共 {} 条记录，并发数 {}", totalInPartition, CONCURRENT_CALLS_PER_PARTITION);
+
+                // 为每条记录提交异步任务
+                for (Row row : pendingRows) {
                     String devSerial = row.getString(0);
                     String videoTextMerged = row.getString(1);
 
-                    try {
-                        // 限流控制
-                        int estimatedTokens = estimateTokens(videoTextMerged);
-                        rateLimiter.acquire(estimatedTokens);
+                    CompletableFuture<Row> future = CompletableFuture.supplyAsync(() -> {
+                        try {
+                            // 限流控制（TPM和RPM双重限流）
+                            long waitStart = System.currentTimeMillis();
+                            int estimatedTokens = estimateTokens(videoTextMerged);
 
-                        // 调用千问模型
-                        String tag = qianwenService.generateTag(videoTextMerged);
+                            synchronized (tpmLimiter) {
+                                tpmLimiter.acquire(estimatedTokens);
+                            }
+                            synchronized (rpmLimiter) {
+                                rpmLimiter.acquire(1); // 每个请求计1
+                            }
 
-                        // 创建结果行
-                        results.add(org.apache.spark.sql.RowFactory.create(devSerial, tag));
-                        processedCount++;
+                            long waitEnd = System.currentTimeMillis();
+                            totalWaitTimeMs.addAndGet(waitEnd - waitStart);
 
-                        if (processedCount % 10 == 0) {
-                            logger.info("当前分区已处理 {} 条记录", processedCount);
+                            // 【P0优化】每个线程独立创建QianwenService，避免共享状态问题
+                            QianwenService qianwenService = new QianwenService(
+                                API_KEY,
+                                MODEL_NAME,
+                                MAX_RETRIES,
+                                RETRY_DELAY_MS
+                            );
+
+                            // 调用千问模型并计时
+                            long apiStart = System.currentTimeMillis();
+                            String tag = qianwenService.generateTag(videoTextMerged);
+                            long apiEnd = System.currentTimeMillis();
+
+                            totalApiTimeMs.addAndGet(apiEnd - apiStart);
+                            int count = processedCount.incrementAndGet();
+
+                            // 每处理20条输出一次进度和性能指标
+                            if (count % 20 == 0) {
+                                long elapsed = System.currentTimeMillis() - partitionStartTime;
+                                double tps = count * 1000.0 / elapsed;
+                                double avgApi = totalApiTimeMs.get() * 1.0 / count;
+                                double avgWait = totalWaitTimeMs.get() * 1.0 / count;
+                                logger.info("[性能] 进度: {}/{}, 吞吐量: {}条/秒, 平均API耗时: {}ms, 平均等待: {}ms",
+                                    count, totalInPartition, String.format("%.2f", tps),
+                                    String.format("%.0f", avgApi), String.format("%.0f", avgWait));
+                            }
+
+                            return org.apache.spark.sql.RowFactory.create(devSerial, tag);
+
+                        } catch (Exception e) {
+                            errorCount.incrementAndGet();
+                            logger.error("处理记录失败 dev_serial={}: {}", devSerial, e.getMessage());
+                            return org.apache.spark.sql.RowFactory.create(devSerial, "ERROR: " + e.getMessage());
                         }
+                    }, executor);
 
+                    futures.add(future);
+                }
+
+                // 等待所有任务完成
+                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+                // 收集结果
+                for (CompletableFuture<Row> future : futures) {
+                    try {
+                        results.add(future.get());
                     } catch (Exception e) {
-                        errorCount++;
-                        logger.error("处理记录失败 dev_serial={}: {}", devSerial, e.getMessage());
-                        // 记录失败但继续处理
-                        results.add(org.apache.spark.sql.RowFactory.create(devSerial, "ERROR: " + e.getMessage()));
+                        logger.error("获取结果失败: {}", e.getMessage());
                     }
                 }
 
-                logger.info("分区处理完成: 成功={}, 失败={}", processedCount, errorCount);
+                // 关闭线程池
+                executor.shutdown();
+
+                // 输出分区处理统计
+                long partitionEndTime = System.currentTimeMillis();
+                long totalTime = partitionEndTime - partitionStartTime;
+                int processed = processedCount.get();
+                int errors = errorCount.get();
+                double throughput = processed * 1000.0 / totalTime;
+                double avgApiTime = processed > 0 ? totalApiTimeMs.get() * 1.0 / processed : 0;
+                double avgWaitTime = processed > 0 ? totalWaitTimeMs.get() * 1.0 / processed : 0;
+
+                logger.info("===== 分区处理完成 =====");
+                logger.info("处理结果: 成功={}, 失败={}, 总记录={}", processed, errors, totalInPartition);
+                logger.info("耗时统计: 总耗时={}秒, 吞吐量={}条/秒", totalTime / 1000, String.format("%.2f", throughput));
+                logger.info("延迟分析: 平均API耗时={}ms, 平均限流等待={}ms", String.format("%.0f", avgApiTime), String.format("%.0f", avgWaitTime));
+                if (avgWaitTime > avgApiTime) {
+                    logger.warn("【瓶颈诊断】限流等待时间({})ms > API调用时间({}ms)，瓶颈是限流配置，建议提高TPM/RPM配额",
+                        String.format("%.0f", avgWaitTime), String.format("%.0f", avgApiTime));
+                } else {
+                    logger.info("【瓶颈诊断】API调用时间({}ms) >= 限流等待({}ms)，瓶颈是API响应速度，当前并发配置合理",
+                        String.format("%.0f", avgApiTime), String.format("%.0f", avgWaitTime));
+                }
+
                 return results.iterator();
             },
             RowEncoder.apply(
