@@ -208,17 +208,41 @@ public class QianwenVideoTextProcessor implements Serializable {
         // 重分区以控制输出文件数
         Dataset<Row> optimizedDataset = finalDataset.coalesce(targetPartitions);
 
-        // 6. 写入Hive表
+        // 6. 写入Hive表 - 性能优化版本
         String targetTable = "dwd.dwd_device_cloudstorage_tag_by_qianwen";
         logger.info("写入目标表: {}", targetTable);
 
-        optimizedDataset.write()
-            .mode(SaveMode.Append)
-            .partitionBy("dt")
-            .format("hive")
-            .saveAsTable(targetTable);
+        // 【性能优化】使用 Parquet 格式 + insertInto 替代 format("hive") + saveAsTable
+        // 1. Parquet 是列式存储，写入和查询性能都更好
+        // 2. insertInto 直接插入数据，避免了 saveAsTable 的表结构检查和元数据操作
+        // 3. 减少与 Hive Metastore 的交互次数，大幅提升写入速度
 
-        logger.info("成功写入数据到表 {}，预计生成 {} 个文件", targetTable, targetPartitions);
+        try {
+            // 方案A：使用 insertInto（推荐，性能最佳）
+            // 前提：目标表必须已存在且结构匹配
+            optimizedDataset.write()
+                .mode(SaveMode.Append)
+                .format("parquet")
+                .insertInto(targetTable);
+
+            logger.info("成功使用 insertInto 写入数据到表 {}，预计生成 {} 个文件",
+                targetTable, targetPartitions);
+
+        } catch (Exception e) {
+            // 如果 insertInto 失败（表不存在或结构不匹配），回退到 saveAsTable
+            logger.warn("insertInto 失败，回退到 saveAsTable 方式: {}", e.getMessage());
+            logger.info("使用 saveAsTable 写入（首次创建表或表结构变更时使用）");
+
+            optimizedDataset.write()
+                .mode(SaveMode.Append)
+                .partitionBy("dt")
+                .format("parquet")  // 使用 parquet 而非 hive 格式
+                .option("compression", "snappy")  // 使用 snappy 压缩，平衡压缩率和速度
+                .saveAsTable(targetTable);
+
+            logger.info("成功使用 saveAsTable 写入数据到表 {}，预计生成 {} 个文件",
+                targetTable, targetPartitions);
+        }
     }
 
     /**
