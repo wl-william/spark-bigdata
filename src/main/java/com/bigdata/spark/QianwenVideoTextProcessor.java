@@ -39,10 +39,14 @@ public class QianwenVideoTextProcessor implements Serializable {
     // 配置参数
     private static final String API_KEY = System.getenv("DASHSCOPE_API_KEY");
     private static final String MODEL_NAME = "qwen3-235b-a22b-instruct-2507";
-    private static final int TPM_LIMIT = 100000; // Tokens per minute
+    private static final int TPM_LIMIT = 100000; // Tokens per minute (账户级别总配额)
     private static final int BATCH_SIZE = 100; // 每批处理的记录数
     private static final int MAX_RETRIES = 3;
     private static final int RETRY_DELAY_MS = 2000;
+
+    // 并行度配置：根据API限流和集群资源合理设置
+    // 分区数过多会导致限流冲突，过少会浪费并行能力
+    private static final int PROCESS_PARTITIONS = 10; // 处理分区数，可根据实际调整
 
     public static void main(String[] args) {
         if (args.length < 1) {
@@ -119,13 +123,26 @@ public class QianwenVideoTextProcessor implements Serializable {
             return;
         }
 
-        // 2. 转换为JavaRDD进行处理
-        Dataset<Row> resultDataset = sourceData.mapPartitions(
+        // 2. 【P0优化】重分区以提升并行度
+        // 使用repartition而非coalesce，确保数据均匀分布到指定分区数
+        int sourcePartitions = sourceData.rdd().getNumPartitions();
+        logger.info("源数据分区数: {}, 将重分区为: {}", sourcePartitions, PROCESS_PARTITIONS);
+
+        Dataset<Row> repartitionedData = sourceData.repartition(PROCESS_PARTITIONS);
+
+        // 【P0优化】计算每个分区的限流配额
+        // 将总配额平分到各分区，避免超出账户级别TPM限制
+        final int perPartitionTPM = TPM_LIMIT / PROCESS_PARTITIONS;
+        logger.info("每分区TPM配额: {} (总配额: {}，分区数: {})",
+            perPartitionTPM, TPM_LIMIT, PROCESS_PARTITIONS);
+
+        // 3. 转换为JavaRDD进行处理
+        Dataset<Row> resultDataset = repartitionedData.mapPartitions(
             (Iterator<Row> partition) -> {
                 List<Row> results = new ArrayList<>();
 
-                // 为每个分区创建限流器和服务实例（避免序列化问题）
-                RateLimiter rateLimiter = new RateLimiter(TPM_LIMIT);
+                // 为每个分区创建限流器，使用分配后的配额（避免多分区超出总限额）
+                RateLimiter rateLimiter = new RateLimiter(perPartitionTPM);
                 QianwenService qianwenService = new QianwenService(
                     API_KEY,
                     MODEL_NAME,
@@ -175,11 +192,11 @@ public class QianwenVideoTextProcessor implements Serializable {
             )
         );
 
-        // 3. 添加分区字段
+        // 4. 添加分区字段
         Dataset<Row> finalDataset = resultDataset.withColumn("dt",
             org.apache.spark.sql.functions.lit(processDate));
 
-        // 4. 优化输出文件数
+        // 5. 优化输出文件数
         // 【重要修复】根据源数据量估算分区数，避免在API调用后再count导致重复执行
         // totalRecords 已在前面获取，直接使用
         int targetPartitions = Math.max(1, (int) Math.ceil(totalRecords / 100000.0));
@@ -191,7 +208,7 @@ public class QianwenVideoTextProcessor implements Serializable {
         // 重分区以控制输出文件数
         Dataset<Row> optimizedDataset = finalDataset.coalesce(targetPartitions);
 
-        // 5. 写入Hive表
+        // 6. 写入Hive表
         String targetTable = "dwd.dwd_device_cloudstorage_tag_by_qianwen";
         logger.info("写入目标表: {}", targetTable);
 
